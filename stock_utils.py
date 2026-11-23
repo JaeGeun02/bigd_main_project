@@ -1,22 +1,57 @@
+"""
+notify_stock_price.py(하루 3회 알림), collect_daily_close.py(하루 1회 종가 수집)가
+공통으로 쓰는 함수 모음.
+
+네이버 금융 비공식 API(m.stock.naver.com)는 장중이면 실시간 체결가를, 장 시작 전/마감
+후에는 가장 최근 종가를 marketStatus/closePrice 필드로 그대로 돌려주므로, 이 하나의
+엔드포인트로 "현재가 조회"와 "일별 종가 기록"을 모두 처리한다.
+"""
 import os
 import io
 import re
 import time
 import requests
+import holidays
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
+# pandas/matplotlib은 read_watchlist()/build_price_chart() 안에서 그때그때 import한다.
+# 이 모듈에서 텔레그램 관련 함수만 가져다 쓰는 경우에는 이 두 (설치·로딩이 무거운) 패키지가
+# 아예 필요 없는데, 모듈 최상단에서 import하면 그런 경우에도 강제로 설치돼 있어야 한다.
+
 WATCHLIST_FILE = "watchlist.csv"
 NUM_HISTORY_DAYS = 15
+# GitHub Actions 실행 환경은 UTC라 datetime.now()(naive)를 그대로 쓰면 스케줄 시각이 아닌
+# 수동/야간 실행 시 날짜가 하루 어긋날 수 있다. 항상 이 KST를 명시해서 기준 시간대를 고정한다.
 KST = ZoneInfo("Asia/Seoul")
 
+# 이 모듈이 임포트되는 시점에 바로 .env를 로드해야, 아래 os.environ.get() 호출이
+# 호출 스크립트의 import 순서와 무관하게 항상 올바른 값을 읽는다.
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
 TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
+
+# holidays.KR()은 한국 공휴일 날짜(datetime.date 객체)들을 담고 있는 특수한 집합(set)이다.
+# "날짜 in _KR_HOLIDAYS"처럼 in 연산자로 그 날짜가 공휴일인지 바로 물어볼 수 있다.
+_KR_HOLIDAYS = holidays.KR()
+
+
+def is_trading_day(date: datetime = None) -> bool:
+    """평일이면서 한국 공휴일이 아닌 날(=KRX 개장일)인지 확인합니다."""
+    # 함수를 호출할 때 date를 안 넘기면(None) 지금 이 순간(오늘, KST 기준)을 기준으로 판단한다.
+    date = date or datetime.now(KST)
+    # datetime.weekday()는 월요일=0, 화요일=1, ... 일요일=6을 반환한다.
+    # 5(토요일) 이상이면 주말이라는 뜻이므로 거래일이 아니다.
+    if date.weekday() >= 5:  # 5=토요일, 6=일요일
+        return False
+    # datetime(날짜+시각)에서 시각 정보를 뺀 date(날짜만)로 변환해야 holidays 집합과 비교할 수 있다.
+    # "not in"이므로 "공휴일 목록에 없으면 True(거래일)"라는 뜻이다.
+    return date.date() not in _KR_HOLIDAYS
+
 
 def read_watchlist(path: str = WATCHLIST_FILE) -> list:
     """watchlist.csv를 읽어 종목코드 리스트를 반환합니다. 실패 시 None."""
@@ -47,6 +82,7 @@ def read_watchlist(path: str = WATCHLIST_FILE) -> list:
     except Exception as e:
         print(f"❌ CSV 파일을 읽는 동안 오류가 발생했습니다: {e}")
         return None
+
 
 def get_turso_client():
     """Turso(libSQL) DB 클라이언트를 생성하고, price_history 테이블이 없으면 만듭니다.
@@ -80,6 +116,7 @@ def get_turso_client():
     )
     return client
 
+
 def load_price_history() -> dict:
     """Turso DB에서 종목별 종가 히스토리를 읽어 {code: [{"date": "YYYYMMDD", "close": 가격}, ...]}
     형태(날짜 오름차순)로 반환합니다. 예전에는 이 함수가 price_history.json 파일을 읽었지만,
@@ -104,6 +141,7 @@ def load_price_history() -> dict:
         # (if code not in history: history[code] = []) 를 한 줄로 줄인 것이다.
         history.setdefault(code, []).append({"date": date, "close": close})
     return history
+
 
 def update_price_history(code: str, date_str: str, close_price: int,
                           num_days: int = NUM_HISTORY_DAYS, client=None) -> None:
@@ -155,6 +193,7 @@ def update_price_history(code: str, date_str: str, close_price: int,
         # 나도 반드시 실행된다(연결이 계속 열린 채로 남는 걸 방지).
         if own_client:
             client.close()
+
 
 def fetch_naver_current_price(code: str, retries: int = 2) -> dict:
     """네이버 금융 비공식 API로 종목의 현재가(장중) 또는 최근 종가(장마감)를 조회합니다.
@@ -226,6 +265,7 @@ def fetch_naver_current_price(code: str, retries: int = 2) -> dict:
 
     return None
 
+
 def fetch_naver_intraday_minutes(code: str, date_str: str = None) -> list:
     """네이버 API로 당일 1분 단위 종가를 조회합니다. 반환값은 시간 오름차순
     [{"time": "HHMM", "price": 가격}, ...]. 실패하거나 아직 장이 시작 전이면 빈 리스트.
@@ -266,6 +306,7 @@ def fetch_naver_intraday_minutes(code: str, date_str: str = None) -> list:
         print(f"❌ [{code}] 당일 분봉 조회 중 오류 발생: {e}")
         return []
 
+
 def send_telegram_message(text: str) -> bool:
     """텔레그램 sendMessage API로 텍스트 메시지를 전송합니다."""
     # 텔레그램 Bot API는 "https://api.telegram.org/bot{토큰}/{기능이름}" 형태의 URL로 호출한다.
@@ -279,6 +320,7 @@ def send_telegram_message(text: str) -> bool:
     except Exception as e:
         print(f"❌ 텔레그램 메시지 전송 중 오류 발생: {e}")
         return False
+
 
 def send_telegram_photo(photo_buffer: io.BytesIO, caption: str) -> bool:
     """텔레그램 sendPhoto API로 이미지를 전송합니다."""
@@ -315,6 +357,7 @@ def describe_price_trend(daily_closes: list, intraday_minutes: list) -> str:
     # 히스토리도 분봉도 없으면 현재가 한 점만 찍힌다.
     return "현재가 (종가 히스토리 누적 전)"
 
+
 def format_rate_badge(price: int, rate: float) -> str:
     """가격과 등락률(%)을 "가격원 세모이모지 부호율%" 형태의 문자열로 변환합니다
     (예: "254,000원 🔺 +1.2%", "254,000원 ▼ -0.5%"). 세모 이모지 바로 앞에 가격 숫자를
@@ -325,6 +368,7 @@ def format_rate_badge(price: int, rate: float) -> str:
     if rate < 0:
         return f"{prefix} ▼ {rate}%"
     return f"{prefix} ▫️ 0.0%"
+
 
 def resolve_today_price(price: int, is_open: bool, intraday_minutes: list,
                         daily_closes: list) -> int:
@@ -344,6 +388,7 @@ def resolve_today_price(price: int, is_open: bool, intraday_minutes: list,
     # 위 셋 다 아니면(애프터마켓 마감 20:00 뒤 ~ 다음 날 장 시작 전, 히스토리는 있음) None을 돌려준다. 빈 리스트([])는
     # 파이썬에서 False로 취급되므로 intraday_minutes/daily_closes만 써도 "비어있는지" 확인이 된다.
     return price if (is_open or intraday_minutes or not daily_closes) else None
+
 
 def dedupe_daily_closes(daily_closes: list, today_price: int, intraday_minutes: list) -> list:
     """daily_closes에 오늘 날짜 종가가 섞여 있어도, 분봉/현재가로 "오늘" 구간을 따로 보여줄
